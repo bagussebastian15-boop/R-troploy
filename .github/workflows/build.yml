@@ -1,0 +1,98 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # Proyek bisa ada di root repo, atau repo hanya berisi zip (batas unggah GitHub 25 MB, jadi proyek dipecah jadi
+      # beberapa zip: RetroPoly-bagian1.zip, RetroPoly-bagian2.zip, ...). Semua zip *bagian* diekstrak ke folder _project yang sama.
+      - name: Siapkan proyek
+        run: |
+          set -euo pipefail
+          if [ ! -f settings.gradle.kts ]; then
+            shopt -s nullglob
+            Zs=(*bagian*.zip)
+            [ ${#Zs[@]} -eq 0 ] && Zs=(*EmulatorAllInOne*.zip)
+            [ ${#Zs[@]} -eq 0 ] && Zs=(*.zip)
+            if [ ${#Zs[@]} -gt 0 ]; then
+              rm -rf _project && mkdir _project
+              for Z in "${Zs[@]}"; do echo "Mengekstrak $Z ke _project"; unzip -qo "$Z" -d _project; done
+            fi
+          fi
+          S="$(find . -name settings.gradle.kts -not -path '*/node_modules/*' | head -n1)"
+          [ -z "$S" ] && { echo "settings.gradle.kts tidak ditemukan"; exit 1; }
+          echo "PROJECT_DIR=$(dirname "$S")" >> "$GITHUB_ENV"
+          echo "Proyek: $(dirname "$S")"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.13
+
+      - name: Terima lisensi Android SDK
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      # M64Plus FZ (ndk-build): NDK 26.1 + platform android-36.
+      - name: Pasang NDK 26.1 + platform 36
+        run: |
+          set -euo pipefail
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;26.1.10909125" "platforms;android-36" "build-tools;36.0.0" > /dev/null
+          ls "$ANDROID_HOME/ndk"
+
+      # Uji cepat (tanpa Android): server lobby (penandaan ZeroTier/Tailscale/LAN).
+      - name: Uji lobby
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          python3 tests/lobby_server_test.py
+          bash tests/run_ethbridge_test.sh
+          bash tests/run_ztdiscovery_test.sh
+          bash tests/run_ztengine_test.sh
+
+      # Mesin ZeroTier tertanam (VPN di dalam aplikasi). OPSIONAL: bila gagal, APK tetap dibuild tanpa ZeroTier tertanam.
+      - name: Siapkan mesin ZeroTier (opsional)
+        id: zt
+        continue-on-error: true
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: bash scripts/setup_zerotier_core.sh
+
+      - name: Build APK debug
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -uo pipefail
+          if [ "${{ steps.zt.outcome }}" = "success" ]; then
+            if gradle assembleDebug --stacktrace -Dorg.gradle.jvmargs="-Xmx4g"; then
+              echo "### ZeroTier tertanam: YA" >> "$GITHUB_STEP_SUMMARY"; exit 0
+            fi
+            echo "::warning::Build dengan ZeroTier tertanam gagal; mengulang tanpa ZeroTier (lihat log di atas dan artifact zerotier-api)."
+            echo "### ZeroTier tertanam: TIDAK (sumber SDK ZeroTier gagal dikompilasi; lihat log)" >> "$GITHUB_STEP_SUMMARY"
+            gradle assembleDebug --stacktrace -PnoZt=true -Dorg.gradle.jvmargs="-Xmx4g"
+          else
+            echo "### ZeroTier tertanam: TIDAK (setup_zerotier_core.sh gagal; lihat langkah sebelumnya)" >> "$GITHUB_STEP_SUMMARY"
+            gradle assembleDebug --stacktrace -PnoZt=true -Dorg.gradle.jvmargs="-Xmx4g"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zerotier-api
+          path: ${{ env.PROJECT_DIR }}/zerotier-api/
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EmulatorAllInOne-debug-apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          retention-days: 3
